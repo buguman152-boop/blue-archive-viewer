@@ -155,47 +155,114 @@ async fn validate_atlas() -> Result<()> {
         .filter(|e| e.path().extension().unwrap_or_default() == "atlas")
         .for_each(|entry| {
             handles.push(tokio::spawn(async move {
-                info!("Checking {}", entry.path().display());
-                let file = std::fs::read_to_string(entry.path()).unwrap();
-                for i in 0..file.lines().count() {
-                    let line = file.lines().nth(i).unwrap();
+                let atlas_path = entry.path().to_path_buf();
+                info!("Checking {}", atlas_path.display());
+                let parent_dir = match atlas_path.parent() {
+                    Some(p) => p.to_path_buf(),
+                    None => {
+                        error!("Atlas {} has no parent directory", atlas_path.display());
+                        return;
+                    }
+                };
+                let file = match std::fs::read_to_string(&atlas_path) {
+                    std::result::Result::Ok(f) => f,
+                    std::result::Result::Err(e) => {
+                        error!("Failed to read atlas {}: {}", atlas_path.display(), e);
+                        return;
+                    }
+                };
+                let lines: Vec<&str> = file.lines().collect();
+                for i in 0..lines.len() {
+                    let line = lines[i];
                     if !line.contains(".png") {
                         continue;
                     }
-                    let filepath = entry.path().parent().unwrap().join(line);
+                    let filepath = parent_dir.join(line.trim());
                     if !filepath.exists() {
                         error!("Missing file: {}", filepath.display());
                         continue;
                     }
-                    // Next line is size
-                    let size_text = file.lines().nth(i + 1).unwrap();
-                    let size: Vec<u32> = size_text
-                        .split(": ")
-                        .nth(1)
-                        .unwrap()
-                        .split(",")
-                        .map(|s| s.parse().unwrap())
+                    // Guard against i+1 out-of-bounds
+                    if i + 1 >= lines.len() {
+                        error!(
+                            "Atlas {}: no size line after '{}'",
+                            atlas_path.display(),
+                            line
+                        );
+                        continue;
+                    }
+                    // Next line is size; tolerate leading whitespace and spaces around the comma
+                    let size_text = lines[i + 1];
+                    let rhs: &str = match size_text.trim().split_once(':') {
+                        Some((_, rhs)) => rhs,
+                        None => {
+                            error!(
+                                "Atlas {}: cannot parse size line '{}'",
+                                atlas_path.display(),
+                                size_text
+                            );
+                            continue;
+                        }
+                    };
+                    let sizes: Vec<u32> = rhs
+                        .split(',')
+                        .filter_map(|s| s.trim().parse::<u32>().ok())
                         .collect();
-                    let dimensions = get_image_dimensions(&filepath).await.unwrap();
-                    if dimensions.0 != size[0] || dimensions.1 != size[1] {
+                    if sizes.len() != 2 {
+                        error!(
+                            "Atlas {}: expected 2 size values in '{}', got {}",
+                            atlas_path.display(),
+                            size_text,
+                            sizes.len()
+                        );
+                        continue;
+                    }
+                    let dimensions = match get_image_dimensions(&filepath).await {
+                        std::result::Result::Ok(d) => d,
+                        std::result::Result::Err(e) => {
+                            error!(
+                                "Failed to get dimensions for {}: {}",
+                                filepath.display(),
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    if dimensions.0 != sizes[0] || dimensions.1 != sizes[1] {
                         error!(
                             "Size mismatch: {} ({}x{}) != {} ({}x{})",
                             &filepath.display(),
                             dimensions.0,
                             dimensions.1,
-                            entry.path().display(),
-                            size[0],
-                            size[1]
+                            atlas_path.display(),
+                            sizes[0],
+                            sizes[1]
                         );
                         // Resize
                         info!("Resizing {}", filepath.display());
-                        let image = image::open(&filepath).unwrap();
+                        let image = match image::open(&filepath) {
+                            std::result::Result::Ok(img) => img,
+                            std::result::Result::Err(e) => {
+                                error!(
+                                    "Failed to open image {}: {}",
+                                    filepath.display(),
+                                    e
+                                );
+                                continue;
+                            }
+                        };
                         let resized = image.resize_exact(
-                            size[0],
-                            size[1],
+                            sizes[0],
+                            sizes[1],
                             image::imageops::FilterType::Nearest,
                         );
-                        resized.save(&filepath).unwrap();
+                        if let Err(e) = resized.save(&filepath) {
+                            error!(
+                                "Failed to save resized image {}: {}",
+                                filepath.display(),
+                                e
+                            );
+                        }
                     }
                 }
             }))
